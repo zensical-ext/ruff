@@ -1247,6 +1247,103 @@ pub fn inlay_hint_call_argument_details<'db>(
     Some(InlayHintCallArgumentDetails { argument_names })
 }
 
+/// Returns the fully qualified name(s) of a type, suitable for IDE features.
+///
+/// Unlike `Type::display()`, which shows only the simple name (e.g. `MyClass`),
+/// this function returns the full dotted path(s) including the module and any
+/// enclosing scopes (e.g. `my_module.Outer.MyClass`).
+///
+/// For union types every branch is resolved independently and the results are
+/// collected into the returned `Vec`.  An empty `Vec` means the type has no
+/// meaningful FQN (e.g. a bare `int` literal, a dynamic type, or an
+/// uninhabited/unknown type).
+///
+/// # Examples
+///
+/// | Type                              | Result                                    |
+/// |-----------------------------------|-------------------------------------------|
+/// | `class MyClass` in `my_module`    | `["my_module.MyClass"]`                   |
+/// | instance of `my_module.MyClass`   | `["my_module.MyClass"]`                   |
+/// | `def my_fn()` in `my_module`      | `["my_module.my_fn"]`                     |
+/// | method `bar` on `Foo` in `mod`    | `["mod.Foo.bar"]`                         |
+/// | module `os.path`                  | `["os.path"]`                             |
+/// | `type Alias = ...` in `my_module` | `["my_module.Alias"]`                     |
+/// | `Thing \| Other` union            | `["lib_b.Thing", "lib_c.Other"]`          |
+pub fn type_fqn<'db>(db: &'db dyn Db, ty: Type<'db>) -> Vec<String> {
+    use crate::types::display;
+
+    /// Build a dotted FQN from the enclosing-scope path components + a leaf name.
+    fn fqn_from_scope_and_name(
+        db: &dyn Db,
+        file: ruff_db::files::File,
+        file_scope: ty_python_core::scope::FileScopeId,
+        name: &str,
+    ) -> String {
+        let components = display::qualified_name_components_from_scope(db, file, file_scope, 0);
+        if components.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", components.join("."), name)
+        }
+    }
+
+    match ty {
+        // A class object itself, e.g. hovering on `MyClass` in `x: MyClass = MyClass()`.
+        Type::ClassLiteral(class) => vec![class.qualified_name(db).to_string()],
+
+        // A specialised generic class, e.g. `list[int]` — report the origin class.
+        Type::GenericAlias(alias) => vec![ClassType::from(alias).qualified_name(db).to_string()],
+
+        // An instance of a concrete class, e.g. `x: MyClass`.
+        Type::NominalInstance(instance) => vec![instance.class(db).qualified_name(db).to_string()],
+
+        // A module literal, e.g. `import os.path` → `os.path`.
+        Type::ModuleLiteral(module_literal) => vec![module_literal.module(db).name(db).to_string()],
+
+        // A function or method object.
+        Type::FunctionLiteral(func) => {
+            let def = func.definition(db);
+            vec![fqn_from_scope_and_name(
+                db,
+                def.file(db),
+                def.file_scope(db),
+                func.name(db).as_str(),
+            )]
+        }
+
+        // A (PEP 695 or legacy) type alias.
+        Type::TypeAlias(alias) => vec![alias.qualified_name(db).to_string()],
+
+        // A bound method, e.g. `instance.my_method`.
+        // The FQN is the same as the underlying function literal.
+        Type::BoundMethod(method) => {
+            let func = method.function(db);
+            let def = func.definition(db);
+            vec![fqn_from_scope_and_name(
+                db,
+                def.file(db),
+                def.file_scope(db),
+                func.name(db).as_str(),
+            )]
+        }
+
+        // A union type: collect FQNs from every branch, preserving order and
+        // removing duplicates while keeping first-occurrence ordering.
+        Type::Union(union) => {
+            let mut seen = rustc_hash::FxHashSet::default();
+            union
+                .elements(db)
+                .iter()
+                .copied()
+                .flat_map(|elem| type_fqn(db, elem))
+                .filter(|fqn| seen.insert(fqn.clone()))
+                .collect()
+        }
+
+        _ => vec![],
+    }
+}
+
 mod resolve_definition {
     //! Resolves an Import, `ImportFrom` or `StarImport` definition to one or more
     //! "resolved definitions". This is done recursively to find the original

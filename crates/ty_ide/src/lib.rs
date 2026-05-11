@@ -16,6 +16,7 @@ mod goto_definition;
 mod goto_type_definition;
 mod hints;
 mod hover;
+mod type_definition_name;
 mod importer;
 mod inlay_hints;
 mod markup;
@@ -39,6 +40,7 @@ pub use folding_range::{FoldingRange, FoldingRangeKind, folding_ranges};
 pub use goto::{goto_declaration, goto_definition, goto_type_definition};
 pub use hints::{Hint, HintKind, hints};
 pub use hover::hover;
+pub use type_definition_name::type_definition_name;
 pub use inlay_hints::{
     InlayHintKind, InlayHintLabel, InlayHintSettings, InlayHintTextEdit, inlay_hints,
 };
