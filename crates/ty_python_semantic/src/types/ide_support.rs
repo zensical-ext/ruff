@@ -1340,6 +1340,11 @@ pub fn type_fqn<'db>(db: &'db dyn Db, ty: Type<'db>) -> Vec<String> {
                 .collect()
         }
 
+        // A special form from `typing` / `typing_extensions`, e.g. `Optional`, `Union`,
+        // `Literal`, `Annotated`, etc.  The Display impl already produces the canonical
+        // "module.Name" string (e.g. `"typing.Optional"`).
+        Type::SpecialForm(special_form) => vec![special_form.to_string()],
+
         _ => vec![],
     }
 }
