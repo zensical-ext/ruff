@@ -46,6 +46,7 @@ Create a .venv in the repo root and install libraries:
 from __future__ import annotations
 
 import argparse
+import ast
 import io
 import json
 import keyword
@@ -661,26 +662,68 @@ class LspClient:
             self._proc.kill()
 
 
-# ── Token extraction ──────────────────────────────────────────────────────────
+# ── Token extraction ─────────────────────────────────────────────────────────
 
-_KEYWORDS = frozenset(keyword.kwlist) | frozenset(getattr(keyword, "softkwlist", []))
+_KEYWORDS = frozenset(keyword.kwlist) | frozenset(keyword.softkwlist)
 
 
-def extract_names(source: str) -> list[tuple[str, int, int]]:
+def _build_keyword_callee_map(
+    source: str,
+) -> dict[tuple[int, int], tuple[int, int]]:
     """
-    Return [(token_string, line_0indexed, col_0indexed), ...] for every
-    non-keyword NAME token in *source*.
+    Walk the AST of *source* and return a mapping
+        (kw_line_0, kw_col) -> (callee_line_0, callee_col)
+    for every keyword-argument name token in a call expression.
 
-    Python's tokenize module uses 1-based line numbers; we convert to the
-    0-based values that LSP expects.
+    Only Name and Attribute callees are handled (the overwhelming common case);
+    complex callees (lambdas, subscripts, …) are silently skipped.
+    **kwargs splats (where kw.arg is None) are also skipped.
     """
-    names: list[tuple[str, int, int]] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    mapping: dict[tuple[int, int], tuple[int, int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            callee_pos = (func.lineno - 1, func.col_offset)
+        elif isinstance(func, ast.Attribute):
+            # The attribute name token starts just before end_col_offset.
+            callee_pos = (func.end_lineno - 1, func.end_col_offset - len(func.attr))
+        else:
+            continue
+        for kw in node.keywords:
+            if kw.arg is None:
+                continue  # **kwargs splat
+            mapping[(kw.lineno - 1, kw.col_offset)] = callee_pos
+    return mapping
+
+
+def extract_names(
+    source: str,
+) -> list[tuple[str, int, int, tuple[int, int] | None]]:
+    """
+    Return [(token, line_0, col_0, callee_pos), ...] for every non-keyword
+    NAME token in *source*.
+
+    *callee_pos* is (line_0, col_0) of the callee's name token when this token
+    is a keyword-argument name inside a call; None for all other tokens.
+    The caller can use this to synthesise a parameter FQN without a round-trip
+    to the language server.
+    """
+    kw_callee = _build_keyword_callee_map(source)
+    names: list[tuple[str, int, int, tuple[int, int] | None]] = []
     try:
         for tok in _tok_mod.generate_tokens(io.StringIO(source).readline):
             if tok.type == _tok_mod.NAME and tok.string not in _KEYWORDS:
                 line_0 = tok.start[0] - 1  # 1→0 indexed
                 col_0 = tok.start[1]  # already 0-indexed
-                names.append((tok.string, line_0, col_0))
+                callee_pos = kw_callee.get((line_0, col_0))
+                names.append((tok.string, line_0, col_0, callee_pos))
     except _tok_mod.TokenError:
         pass
     return names
@@ -771,17 +814,27 @@ def run_snippets(
             },
         )
 
-        # ── Query each name ───────────────────────────────────────────────
+        # ── Query each name ───────────────────────────────────────────────────
+        # Pass 1 – query the LSP for every token that is NOT a keyword-argument
+        # name.  Keyword-argument tokens are deferred: their FQN is synthesised
+        # from the callee's already-resolved FQN without a server round-trip.
         names = extract_names(snippet)
-        results: list[tuple[str, int, int, list[str]]] = []
         n_names = len(names)
+        # (name, line, col, callee_pos_or_None, fqns)
+        pre: list[tuple[str, int, int, tuple[int, int] | None, list[str]]] = []
+        fqn_by_pos: dict[tuple[int, int], list[str]] = {}
 
-        for i, (name, line, col) in enumerate(names):
+        for i, (name, line, col, callee_pos) in enumerate(names):
             print(
                 f"\r  {snippet_label}  {i + 1}/{n_names} tokens …    ",
                 end="",
                 flush=True,
             )
+
+            if callee_pos is not None:
+                # Keyword-argument name: defer, no LSP query needed.
+                pre.append((name, line, col, callee_pos, []))
+                continue
 
             resp = client.request(
                 "ty/typeDefinitionName",
@@ -795,6 +848,16 @@ def run_snippets(
             if resp.get("result") is not None:
                 fqns = resp["result"].get("names", [])
 
+            pre.append((name, line, col, None, fqns))
+            fqn_by_pos[(line, col)] = fqns
+
+        # Pass 2 – resolve deferred keyword-argument tokens.
+        # "path.to.Callee{param:keyword_name}"
+        results: list[tuple[str, int, int, list[str]]] = []
+        for name, line, col, callee_pos, fqns in pre:
+            if callee_pos is not None:
+                callee_fqns = fqn_by_pos.get(callee_pos, [])
+                fqns = [f"{fqn}{{param:{name}}}" for fqn in callee_fqns]
             results.append((name, line, col, fqns))
 
         n_resolved = sum(1 for *_, fqns in results if fqns)
