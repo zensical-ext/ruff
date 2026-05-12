@@ -746,6 +746,7 @@ def run_snippets(
     client.notify("initialized", {})
 
     all_results: list[tuple[str, str, list[tuple[str, int, int, list[str]]]]] = []
+    n_total_snippets = len(snippets)
 
     for idx, (title, snippet) in enumerate(snippets):
         # Use a unique virtual filename per snippet so ty treats each as a
@@ -753,6 +754,9 @@ def run_snippets(
         virtual_name = f"_snippet_{idx:02d}.py"
         dummy_path = SCRIPT_DIR / virtual_name
         file_uri = dummy_path.as_uri()
+
+        snippet_label = f"[{idx + 1}/{n_total_snippets}] {title}"
+        print(f"  {snippet_label} …", end="", flush=True)
 
         # ── Open document ─────────────────────────────────────────────────
         client.notify(
@@ -767,14 +771,18 @@ def run_snippets(
             },
         )
 
-        # Allow the server to complete its first analysis pass for this file.
-        time.sleep(0.8)
-
         # ── Query each name ───────────────────────────────────────────────
         names = extract_names(snippet)
         results: list[tuple[str, int, int, list[str]]] = []
+        n_names = len(names)
 
-        for name, line, col in names:
+        for i, (name, line, col) in enumerate(names):
+            print(
+                f"\r  {snippet_label}  {i + 1}/{n_names} tokens …    ",
+                end="",
+                flush=True,
+            )
+
             resp = client.request(
                 "ty/typeDefinitionName",
                 {
@@ -788,6 +796,9 @@ def run_snippets(
                 fqns = resp["result"].get("names", [])
 
             results.append((name, line, col, fqns))
+
+        n_resolved = sum(1 for *_, fqns in results if fqns)
+        print(f"\r  {snippet_label}  {n_resolved}/{n_names} resolved       ")
 
         all_results.append((title, snippet, results))
 
