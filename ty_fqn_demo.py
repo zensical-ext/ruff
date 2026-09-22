@@ -669,22 +669,35 @@ _KEYWORDS = frozenset(keyword.kwlist) | frozenset(keyword.softkwlist)
 
 def _build_keyword_callee_map(
     source: str,
-) -> dict[tuple[int, int], tuple[int, int]]:
+) -> tuple[
+    dict[tuple[int, int], tuple[int, int]],
+    dict[tuple[int, int], tuple[tuple[int, int], str]],
+]:
     """
-    Walk the AST of *source* and return a mapping
-        (kw_line_0, kw_col) -> (callee_line_0, callee_col)
-    for every keyword-argument name token in a call expression.
+    Walk the AST of *source* and return two mappings:
 
-    Only Name and Attribute callees are handled (the overwhelming common case);
-    complex callees (lambdas, subscripts, …) are silently skipped.
-    **kwargs splats (where kw.arg is None) are also skipped.
+    *kw_map*: (kw_line_0, kw_col) -> (callee_line_0, callee_col)
+        For every keyword-argument name, the token position of the callee.
+
+    *attr_fallback*: (callee_attr_line_0, callee_attr_col) -> (obj_line_0, obj_col), attr_name)
+        For attribute callees (``obj.method(kw=val)``), the position of the
+        object name token and the attribute name string.  When the callee token
+        itself does not resolve to an FQN (e.g. because ty cannot determine the
+        bound-method type through a ``with … as`` context), the caller can
+        instead look up the object\'s FQN and append ``.attr_name``.
+        Only populated when the object is a plain Name node.
+
+    Only Name and Attribute callees are handled; complex callees (lambdas,
+    subscripts, …) are silently skipped.  **kwargs splats are also skipped.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return {}
+        return {}, {}
 
-    mapping: dict[tuple[int, int], tuple[int, int]] = {}
+    kw_map: dict[tuple[int, int], tuple[int, int]] = {}
+    attr_fallback: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -694,28 +707,38 @@ def _build_keyword_callee_map(
         elif isinstance(func, ast.Attribute):
             # The attribute name token starts just before end_col_offset.
             callee_pos = (func.end_lineno - 1, func.end_col_offset - len(func.attr))
+            # When the method token itself doesn't resolve, fall back to
+            # object_fqn + "." + attr_name.  Only feasible for plain-name objects.
+            if isinstance(func.value, ast.Name):
+                obj_pos = (func.value.lineno - 1, func.value.col_offset)
+                attr_fallback[callee_pos] = (obj_pos, func.attr)
         else:
             continue
         for kw in node.keywords:
             if kw.arg is None:
                 continue  # **kwargs splat
-            mapping[(kw.lineno - 1, kw.col_offset)] = callee_pos
-    return mapping
+            kw_map[(kw.lineno - 1, kw.col_offset)] = callee_pos
+    return kw_map, attr_fallback
 
 
 def extract_names(
     source: str,
-) -> list[tuple[str, int, int, tuple[int, int] | None]]:
+) -> tuple[
+    list[tuple[str, int, int, tuple[int, int] | None]],
+    dict[tuple[int, int], tuple[tuple[int, int], str]],
+]:
     """
-    Return [(token, line_0, col_0, callee_pos), ...] for every non-keyword
-    NAME token in *source*.
+    Return ``(names, attr_fallback)`` where:
 
-    *callee_pos* is (line_0, col_0) of the callee's name token when this token
-    is a keyword-argument name inside a call; None for all other tokens.
-    The caller can use this to synthesise a parameter FQN without a round-trip
-    to the language server.
+    *names* is [(token, line_0, col_0, callee_pos), ...] for every non-keyword
+    NAME token in *source*.  *callee_pos* is (line_0, col_0) of the callee's
+    name token when this token is a keyword-argument name inside a call; None
+    for all other tokens.
+
+    *attr_fallback* maps callee_attr_pos -> (obj_pos, attr_name) for attribute
+    callees whose object is a plain name (see ``_build_keyword_callee_map``).
     """
-    kw_callee = _build_keyword_callee_map(source)
+    kw_callee, attr_fallback = _build_keyword_callee_map(source)
     names: list[tuple[str, int, int, tuple[int, int] | None]] = []
     try:
         for tok in _tok_mod.generate_tokens(io.StringIO(source).readline):
@@ -726,7 +749,7 @@ def extract_names(
                 names.append((tok.string, line_0, col_0, callee_pos))
     except _tok_mod.TokenError:
         pass
-    return names
+    return names, attr_fallback
 
 
 # ── FQN queries (single server, multiple snippets) ────────────────────────────
@@ -818,7 +841,7 @@ def run_snippets(
         # Pass 1 – query the LSP for every token that is NOT a keyword-argument
         # name.  Keyword-argument tokens are deferred: their FQN is synthesised
         # from the callee's already-resolved FQN without a server round-trip.
-        names = extract_names(snippet)
+        names, attr_fallback = extract_names(snippet)
         n_names = len(names)
         # (name, line, col, callee_pos_or_None, fqns)
         pre: list[tuple[str, int, int, tuple[int, int] | None, list[str]]] = []
@@ -852,11 +875,19 @@ def run_snippets(
             fqn_by_pos[(line, col)] = fqns
 
         # Pass 2 – resolve deferred keyword-argument tokens.
-        # "path.to.Callee{param:keyword_name}"
+        # Primary:  callee_fqn + "{param:name}"
+        # Fallback: for attribute callees (obj.method) where the method token
+        #           itself didn't resolve, construct the FQN from the object's
+        #           already-queried FQN plus the method name.
         results: list[tuple[str, int, int, list[str]]] = []
         for name, line, col, callee_pos, fqns in pre:
             if callee_pos is not None:
                 callee_fqns = fqn_by_pos.get(callee_pos, [])
+                if not callee_fqns and callee_pos in attr_fallback:
+                    obj_pos, attr_name = attr_fallback[callee_pos]
+                    callee_fqns = [
+                        f"{fqn}.{attr_name}" for fqn in fqn_by_pos.get(obj_pos, [])
+                    ]
                 fqns = [f"{fqn}{{param:{name}}}" for fqn in callee_fqns]
             results.append((name, line, col, fqns))
 

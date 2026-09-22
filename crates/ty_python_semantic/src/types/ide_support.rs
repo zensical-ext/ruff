@@ -1349,6 +1349,72 @@ pub fn type_fqn<'db>(db: &'db dyn Db, ty: Type<'db>) -> Vec<String> {
     }
 }
 
+/// If `name_expr` sits inside a class body, walks the MRO of the enclosing
+/// class starting from its **first base** (the class itself is skipped) and
+/// returns `"qualified.BaseName.attr_name"` for the first ancestor that
+/// declares an own member with the same name.
+///
+/// This is used as a fallback in the `ty/typeDefinitionName` handler when the
+/// normal type-based FQN lookup yields nothing — the canonical example being
+/// SQLAlchemy-style `__tablename__ = "departments"` inside an ORM model class.
+///
+/// Returns `None` when:
+/// - the expression is not directly inside a class body, or
+/// - the enclosing class cannot be resolved to a static definition, or
+/// - no base class in the MRO declares an attribute with this name.
+pub fn class_member_fqn_from_mro<'db>(
+    db: &'db dyn Db,
+    model: &SemanticModel<'db>,
+    name_expr: &ast::ExprName,
+) -> Option<String> {
+    let file = model.file();
+
+    // Find the scope that directly contains this expression.
+    let file_scope = model.scope(name_expr.into())?;
+    let index = semantic_index(db, file);
+    let scope = index.scope(file_scope);
+
+    // We only handle names that live in a class body.
+    let class_def_ref = scope.node().as_class()?;
+
+    // Resolve the AST node to a ClassLiteral via its Salsa definition.
+    let module_ref = parsed_module(db, file).load(db);
+    let class_def = class_def_ref.node(&module_ref);
+    let class_definition = index.expect_single_definition(class_def);
+    let ClassLiteral::Static(class_static) = (match crate::types::binding_type(db, class_definition)
+    {
+        Type::ClassLiteral(lit) => lit,
+        _ => return None,
+    }) else {
+        return None;
+    };
+
+    let attr_name = name_expr.id.as_str();
+
+    // Walk the MRO from the first *base* class onward.  For each concrete
+    // (statically-defined) ancestor, check whether it declares the attribute
+    // in its own class scope.  Return the FQN of the first match.
+    for ancestor in ClassLiteral::Static(class_static)
+        .iter_mro(db)
+        .skip(1) // skip the class itself
+        .filter_map(ClassBase::into_class)
+        .filter_map(|cls| cls.static_class_literal(db).map(|(lit, _)| lit))
+    {
+        let ancestor_scope = ancestor.body_scope(db);
+        if ty_python_core::place_table(db, ancestor_scope)
+            .symbol_id(attr_name)
+            .is_some()
+        {
+            return Some(format!(
+                "{}.{attr_name}",
+                ClassLiteral::Static(ancestor).qualified_name(db),
+            ));
+        }
+    }
+
+    None
+}
+
 mod resolve_definition {
     //! Resolves an Import, `ImportFrom` or `StarImport` definition to one or more
     //! "resolved definitions". This is done recursively to find the original
